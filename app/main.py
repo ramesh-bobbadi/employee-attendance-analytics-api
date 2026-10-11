@@ -8,6 +8,7 @@ This file was written quickly by a colleague who has left the company. The happy
 works, but nobody has reviewed it. Read PROBLEM_STATEMENT.docx for what is expected of you,
 openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
+import calendar
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -15,6 +16,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Annotated, Literal, Optional
 
+from bson import Decimal128
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Path, Query
 from fastapi.exceptions import RequestValidationError
@@ -42,8 +44,10 @@ EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 ONE_SECOND = timedelta(seconds=1)
 MAX_SHIFT_LENGTH = timedelta(hours=24)
 HALF_DAY_BELOW = 4.5  # R5, compared with the rounded work_hours
+PRESENCE = ("PRESENT", "WFH", "ON_DUTY")  # R6
 NOT_PRESENT = ("ABSENT", "LEAVE")
 WRITE_ATTEMPTS = 10  # optimistic-concurrency retries before a conditional write gives up with 409
+TREND_MAX_DAYS = 92  # inclusive day count of the longest trend range
 
 
 # --------------------------------------------------------------------------- #
@@ -63,6 +67,7 @@ def ensure_indexes() -> None:
         [("emp_code", ASCENDING), ("date", ASCENDING)], unique=True, name="emp_code_date_unique"
     )
     db.attendance_logs.create_index([("date", DESCENDING), ("emp_code", ASCENDING)], name="date_desc_emp_code")
+    db.employees.create_index([("joined_on", ASCENDING)], name="joined_on")  # department summary's R9 population
     _indexes_ready = True
 
 
@@ -236,8 +241,14 @@ def _real_date(value: str) -> str:
     return value
 
 
+def _real_month(value: str) -> str:
+    date.fromisoformat(value + "-01")  # year 0000 matches the pattern but is not a real month
+    return value
+
+
 # [0-9] rather than \d: pydantic's regex engine treats \d as any Unicode digit.
 DateStr = Annotated[str, Field(pattern=r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$"), AfterValidator(_real_date)]
+Month = Annotated[str, Field(pattern=r"^[0-9]{4}-(0[1-9]|1[0-2])$"), AfterValidator(_real_month)]
 HHMM = Annotated[str, Field(pattern=r"^([01][0-9]|2[0-3]):[0-5][0-9]$")]
 # strict: rejects floats (even 1.0), numeric strings and booleans; bounds reject seconds-looking values.
 EpochMillis = Annotated[int, Field(strict=True, ge=100_000_000_000, le=4_102_444_800_000)]
@@ -245,6 +256,7 @@ Status = Literal["PRESENT", "ABSENT", "LEAVE", "WFH", "ON_DUTY"]
 PresenceStatus = Literal["PRESENT", "WFH", "ON_DUTY"]
 Page = Annotated[int, Query(ge=1)]
 PageSize = Annotated[int, Query(ge=1, le=100)]
+Limit = Annotated[int, Query(ge=1, le=50)]
 
 
 class EmployeeIn(BaseModel):
@@ -490,10 +502,301 @@ def regularize_attendance(emp_code: str, date: Annotated[DateStr, Path()], body:
 
 
 # --------------------------------------------------------------------------- #
+# Analytics
+# --------------------------------------------------------------------------- #
+# Every figure is computed inside MongoDB from the STORED derived fields (DATA_MODEL: they are authoritative, and a
+# legacy value may differ from what the punch times would give today); the punch times are never even fetched. Each
+# pipeline is built by a function of the request parameters, so the explain endpoint can run exactly what the endpoint
+# runs.
+LOG_DEFAULTS = {"late_minutes": 0, "overtime_minutes": 0, "half_day": False}  # DATA_MODEL: what a missing field means
+LOG_FIELDS = {"_id": 0, "date": 1, "status": 1, "work_hours": 1, "late_minutes": 1, "overtime_minutes": 1,
+              "half_day": 1}
+
+
+def month_bounds(month: str) -> tuple[str, str]:
+    """First and last day of a YYYY-MM month, as YYYY-MM-DD strings (compared as strings, like the stored dates)."""
+    year, mon = map(int, month.split("-"))
+    return f"{month}-01", f"{month}-{calendar.monthrange(year, mon)[1]:02d}"
+
+
+def calendar_day(date_string) -> dict:
+    """A YYYY-MM-DD string as a BSON date at UTC midnight. A calendar date is not an instant; UTC is only a neutral
+    carrier, so weekdays and day steps come out the same on any host."""
+    return {"$dateFromString": {"dateString": date_string, "format": "%Y-%m-%d", "timezone": "UTC"}}
+
+
+def is_weekday(day) -> dict:
+    """R7: Mon-Fri. `day` is a date from calendar_day()."""
+    return {"$lte": [{"$isoDayOfWeek": day}, 5]}
+
+
+def stored(field: str, log: str = "") -> dict:
+    """A stored derived field of the current document, or of the array element `log` ("$$log"), with DATA_MODEL's
+    meaning of a missing value. work_hours has no documented default and is never passed here."""
+    return {"$ifNull": [f"{log}.{field}" if log else f"${field}", LOG_DEFAULTS[field]]}
+
+
+def presence_weight(log: str) -> dict:
+    """R5/R6: a presence-status record is one present day, half of one when its stored half_day is true; others 0."""
+    return {"$cond": [{"$in": [f"{log}.status", list(PRESENCE)]}, {"$cond": [stored("half_day", log), 0.5, 1]}, 0]}
+
+
+def half_up(value, places: int) -> dict:
+    """R8 inside a pipeline. $round is half-to-even (3.125 -> 3.12), so: Decimal128 ($toDecimal keeps 15 significant
+    digits, so a stored 2.01 is exactly 2.01), add half a unit, floor. Only for values >= 0; null stays null."""
+    scale = 10 ** places
+    scaled = {"$multiply": [{"$toDecimal": value}, scale]}
+    return {"$divide": [{"$floor": {"$add": [scaled, Decimal128("0.5")]}}, scale]}
+
+
+def logs_in_range(first: str, last: str) -> dict:
+    """$lookup of the employee's records dated first..last (inclusive) into `logs`; served by the unique
+    (emp_code, date) index. An employee without records gets logs: [] and is still there."""
+    return {"$lookup": {
+        "from": "attendance_logs", "localField": "emp_code", "foreignField": "emp_code",
+        "pipeline": [{"$match": {"date": {"$gte": first, "$lte": last}}}, {"$project": LOG_FIELDS}],
+        "as": "logs",
+    }}
+
+
+def _count_logs(cond) -> dict:
+    return {"$size": {"$filter": {"input": "$logs", "as": "log", "cond": cond}}}
+
+
+def _sum_logs(value) -> dict:
+    return {"$sum": {"$map": {"input": "$logs", "as": "log", "in": value}}}
+
+
+def log_totals() -> dict:
+    """One employee's figures over `logs`. present_days counts Mon-Fri records only, while late and overtime include
+    weekend records (R7). work_hours is summed as Decimal128 over presence records that have a value, together with
+    how many there are, so a department average is over records."""
+    has_work_hours = {"$and": [{"$in": ["$$log.status", list(PRESENCE)]}, {"$isNumber": "$$log.work_hours"}]}
+    return {
+        "present_days": _sum_logs({"$cond": [is_weekday(calendar_day("$$log.date")), presence_weight("$$log"), 0]}),
+        "leave_days": _count_logs({"$eq": ["$$log.status", "LEAVE"]}),
+        "on_duty_count": _count_logs({"$eq": ["$$log.status", "ON_DUTY"]}),
+        "late_count": _count_logs({"$gt": [stored("late_minutes", "$$log"), 0]}),
+        "total_late_minutes": _sum_logs(stored("late_minutes", "$$log")),
+        "total_overtime_minutes": _sum_logs(stored("overtime_minutes", "$$log")),
+        "work_hours_sum": _sum_logs({"$cond": [has_work_hours, {"$toDecimal": "$$log.work_hours"}, 0]}),
+        "work_hours_records": _count_logs(has_work_hours),
+    }
+
+
+def working_days(first: str, last: str) -> dict:
+    """R7: Mon-Fri from first (or from joined_on, for someone who joined later) to last; 0 if they join after last."""
+    return {"$let": {
+        "vars": {"start": calendar_day({"$max": ["$joined_on", first]})},
+        "in": {"$size": {"$filter": {
+            "input": {"$range": [0, {"$max": [0, {"$add": [
+                {"$dateDiff": {"startDate": "$$start", "endDate": calendar_day(last), "unit": "day"}}, 1]}]}]},
+            "as": "offset",
+            "cond": is_weekday({"$dateAdd": {"startDate": "$$start", "unit": "day", "amount": "$$offset"}}),
+        }}},
+    }}
+
+
+def employee_monthly_pipeline(emp_code: str, month: str) -> list:
+    first, last = month_bounds(month)
+    return [
+        {"$match": {"emp_code": emp_code}},
+        logs_in_range(first, last),
+        {"$project": {"_id": 0, "working_days": working_days(first, last), **log_totals()}},
+        {"$project": {
+            "working_days": 1,
+            "present_days": {"$toDouble": "$present_days"},
+            "leave_days": 1,
+            "late_count": 1,
+            "total_late_minutes": 1,
+            "total_overtime_minutes": 1,
+            "attendance_pct": {"$cond": [
+                {"$gt": ["$working_days", 0]},
+                {"$toDouble": half_up({"$divide": [{"$multiply": [{"$toDecimal": "$present_days"}, 100]},
+                                                   "$working_days"]}, 2)},
+                None,
+            ]},
+        }},
+    ]
+
+
+@app.get("/analytics/employees/{emp_code}/monthly")
+def employee_monthly(emp_code: str, month: Annotated[Month, Query()]):
+    rows = list(db.employees.aggregate(employee_monthly_pipeline(emp_code, month)))
+    if not rows:
+        raise HTTPException(404, "employee not found")
+    return {"emp_code": emp_code, "month": month, **rows[0]}
+
+
+def department_summary_pipeline(month: str, department: Optional[str]) -> list:
+    """Starts from employees, so someone with no logs is still one row (with logs: []). The population is R9's
+    headcount: joined on or before the last day of the month. A department with nobody in it never reaches the $group,
+    so it is omitted. avg_work_hours is the summed work_hours over the summed number of records that have one: an
+    average over records, not of per-employee averages."""
+    first, last = month_bounds(month)
+    population = {"joined_on": {"$lte": last}}
+    if department:
+        population["department"] = department
+    return [
+        {"$match": population},
+        logs_in_range(first, last),
+        {"$project": {"_id": 0, "department": 1, **log_totals()}},
+        {"$group": {
+            "_id": "$department",
+            "headcount": {"$sum": 1},
+            "present_days": {"$sum": "$present_days"},
+            "work_hours_sum": {"$sum": "$work_hours_sum"},
+            "work_hours_records": {"$sum": "$work_hours_records"},
+            "late_count": {"$sum": "$late_count"},
+            "total_late_minutes": {"$sum": "$total_late_minutes"},
+            "leave_count": {"$sum": "$leave_days"},
+            "on_duty_count": {"$sum": "$on_duty_count"},
+        }},
+        {"$sort": {"_id": 1}},
+        {"$project": {
+            "_id": 0,
+            "department": "$_id",
+            "headcount": 1,
+            "present_days": {"$toDouble": "$present_days"},
+            "avg_work_hours": {"$cond": [
+                {"$gt": ["$work_hours_records", 0]},
+                {"$toDouble": half_up({"$divide": ["$work_hours_sum", "$work_hours_records"]}, 2)},
+                None,
+            ]},
+            "late_count": 1,
+            "total_late_minutes": 1,
+            "leave_count": 1,
+            "on_duty_count": 1,
+        }},
+    ]
+
+
+@app.get("/analytics/departments/summary")
+def department_summary(month: Annotated[Month, Query()], department: Optional[str] = None):
+    return {"month": month, "items": list(db.employees.aggregate(department_summary_pipeline(month, department)))}
+
+
+def late_leaderboard_pipeline(month: str, limit: int, department: Optional[str]) -> list:
+    """Totals per employee over the month's records (weekends included), then the employee join, which drops logs of
+    unknown employees and, with a department, everyone outside it, BEFORE ranking. $rank gives competition ranks
+    (1, 2, 2, 4); limit filters on the rank afterwards, so a tie at the cutoff returns every tied row."""
+    first, last = month_bounds(month)
+    late = stored("late_minutes")
+    in_department = [{"$match": {"department": department}}] if department else []
+    return [
+        {"$match": {"date": {"$gte": first, "$lte": last}}},
+        {"$group": {
+            "_id": "$emp_code",
+            "total_late_minutes": {"$sum": late},
+            "late_count": {"$sum": {"$cond": [{"$gt": [late, 0]}, 1, 0]}},
+        }},
+        {"$match": {"total_late_minutes": {"$gt": 0}}},
+        {"$lookup": {
+            "from": "employees", "localField": "_id", "foreignField": "emp_code",
+            "pipeline": in_department + [{"$project": {"_id": 0, "name": 1, "department": 1}}],
+            "as": "employee",
+        }},
+        {"$unwind": "$employee"},
+        {"$setWindowFields": {"sortBy": {"total_late_minutes": -1}, "output": {"rank": {"$rank": {}}}}},
+        {"$match": {"rank": {"$lte": limit}}},
+        {"$sort": {"total_late_minutes": -1, "_id": 1}},
+        {"$project": {
+            "_id": 0,
+            "rank": 1,
+            "emp_code": "$_id",
+            "name": "$employee.name",
+            "department": "$employee.department",
+            "total_late_minutes": 1,
+            "late_count": 1,
+        }},
+    ]
+
+
+@app.get("/analytics/leaderboard/late")
+def late_leaderboard(month: Annotated[Month, Query()], limit: Limit = 10, department: Optional[str] = None):
+    pipeline = late_leaderboard_pipeline(month, limit, department)
+    return {"month": month, "items": list(db.attendance_logs.aggregate(pipeline))}
+
+
+def check_trend_range(first: str, last: str) -> None:
+    days = (date.fromisoformat(last) - date.fromisoformat(first)).days + 1
+    if days < 1:
+        raise validation_error(("query", "to"), "to must be on or after from", last)
+    if days > TREND_MAX_DAYS:
+        raise validation_error(("query", "to"), f"the range must not exceed {TREND_MAX_DAYS} days", last)
+
+
+def department_trend_pipeline(department: str, first: str, last: str) -> list:
+    """One row per calendar day first..last. Each employee of the department becomes "day events": the two ends of
+    the range (so $densify's "full" bounds are exactly first..last), the day they count towards headcount (joined_on,
+    or first if they joined earlier; none if they join after last) and one event per record. Events are summed per
+    day; $densify then adds the days nobody has an event on. Those generated rows are trend rows only; no attendance
+    record is created or assumed for them. Headcount on a day is the running total of joins (R9). The moving average
+    is over the reported (rounded) rates of the current and up to 6 preceding rows; rows before `first` do not exist
+    here, so the first rows have a shorter window."""
+    late = {"$cond": [{"$gt": [stored("late_minutes", "$$log"), 0]}, 1, 0]}
+    events = {"$concatArrays": [
+        [{"day": first}, {"day": last}],
+        {"$cond": [{"$lte": ["$joined_on", last]}, [{"day": {"$max": ["$joined_on", first]}, "joined": 1}], []]},
+        {"$map": {"input": "$logs", "as": "log",
+                  "in": {"day": "$$log.date", "present": presence_weight("$$log"), "late": late}}},
+    ]}
+    return [
+        {"$match": {"department": department}},
+        logs_in_range(first, last),
+        {"$project": {"_id": 0, "event": events}},
+        {"$unwind": "$event"},
+        {"$group": {
+            "_id": "$event.day",
+            "joined": {"$sum": "$event.joined"},
+            "present_count": {"$sum": "$event.present"},
+            "late_count": {"$sum": "$event.late"},
+        }},
+        {"$project": {"_id": 0, "date": calendar_day("$_id"), "joined": 1, "present_count": 1, "late_count": 1}},
+        {"$densify": {"field": "date", "range": {"step": 1, "unit": "day", "bounds": "full"}}},
+        {"$setWindowFields": {"sortBy": {"date": 1}, "output": {
+            "headcount": {"$sum": "$joined", "window": {"documents": ["unbounded", "current"]}},
+        }}},
+        {"$set": {
+            "is_working_day": is_weekday("$date"),
+            "present_count": {"$ifNull": ["$present_count", 0]},
+            "late_count": {"$ifNull": ["$late_count", 0]},
+        }},
+        {"$set": {"attendance_rate": {"$cond": [
+            {"$and": ["$is_working_day", {"$gt": ["$headcount", 0]}]},
+            half_up({"$divide": [{"$toDecimal": "$present_count"}, "$headcount"]}, 4),
+            None,
+        ]}}},
+        {"$setWindowFields": {"sortBy": {"date": 1}, "output": {
+            "moving_avg_7d": {"$avg": "$attendance_rate", "window": {"documents": [-6, "current"]}},
+        }}},
+        {"$sort": {"date": 1}},
+        {"$project": {
+            "date": {"$dateToString": {"date": "$date", "format": "%Y-%m-%d", "timezone": "UTC"}},
+            "is_working_day": 1,
+            "headcount": 1,
+            "present_count": {"$toDouble": "$present_count"},
+            "late_count": 1,
+            "attendance_rate": {"$toDouble": "$attendance_rate"},
+            "moving_avg_7d": {"$toDouble": half_up("$moving_avg_7d", 4)},
+        }},
+    ]
+
+
+@app.get("/analytics/departments/{department}/trend")
+def department_trend(
+    department: str,
+    from_: Annotated[DateStr, Query(alias="from")],
+    to: Annotated[DateStr, Query()],
+):
+    check_trend_range(from_, to)
+    items = list(db.employees.aggregate(department_trend_pipeline(department, from_, to)))
+    if not items:  # every department with an employee yields to - from + 1 rows
+        raise HTTPException(404, "department not found")
+    return {"department": department, "items": items}
+
+
+# --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
-#   GET   /analytics/employees/{emp_code}/monthly
-#   GET   /analytics/departments/summary
-#   GET   /analytics/leaderboard/late
-#   GET   /analytics/departments/{department}/trend
 #   GET   /admin/explain/{endpoint}
 # --------------------------------------------------------------------------- #
