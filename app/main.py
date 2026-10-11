@@ -16,11 +16,11 @@ from decimal import ROUND_HALF_UP, Decimal
 from typing import Annotated, Literal, Optional
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Path, Query
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import AfterValidator, BaseModel, Field, model_validator
-from pymongo import ASCENDING, DESCENDING, MongoClient
+from pymongo import ASCENDING, DESCENDING, MongoClient, ReturnDocument
 from pymongo.errors import DuplicateKeyError, PyMongoError
 
 load_dotenv()  # does not override variables already set in the real environment
@@ -40,6 +40,10 @@ db = client[os.getenv("MONGO_DB", "attendance_db")]
 IST = timezone(timedelta(hours=5, minutes=30))
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 ONE_SECOND = timedelta(seconds=1)
+MAX_SHIFT_LENGTH = timedelta(hours=24)
+HALF_DAY_BELOW = 4.5  # R5, compared with the rounded work_hours
+NOT_PRESENT = ("ABSENT", "LEAVE")
+WRITE_ATTEMPTS = 10  # optimistic-concurrency retries before a conditional write gives up with 409
 
 
 # --------------------------------------------------------------------------- #
@@ -91,6 +95,12 @@ def truncate(dt: datetime) -> datetime:
     return dt.replace(microsecond=0)
 
 
+def bson_now() -> datetime:
+    """Server clock as stored by MongoDB (BSON dates keep milliseconds), so the response matches what is stored."""
+    now = datetime.now(timezone.utc)
+    return now.replace(microsecond=now.microsecond // 1000 * 1000)
+
+
 def round_half_up(value, places: int) -> float:
     """value must be an int, str or Decimal (a float would carry its binary error into the rounding)."""
     return float(Decimal(value).quantize(Decimal(1).scaleb(-places), rounding=ROUND_HALF_UP))
@@ -133,6 +143,38 @@ def compute_overtime(punch_out: datetime, shift_start: str, shift_end: str, date
     return minutes if minutes >= 30 else 0
 
 
+def punch_out_fields(punch_in: datetime, punch_out: datetime, emp: dict, date_str: str) -> dict:
+    """R3-R5: what punch-out (and a correction that leaves a punch_out) stores."""
+    work_hours = compute_work_hours(punch_in, punch_out)
+    return {
+        "work_hours": work_hours,
+        "overtime_minutes": compute_overtime(punch_out, emp["shift_start"], emp["shift_end"], date_str),
+        "half_day": work_hours < HALF_DAY_BELOW,
+    }
+
+
+def derived_fields(punch_in: Optional[datetime], punch_out: Optional[datetime], emp: dict, date_str: str) -> dict:
+    """R2-R5 from the final times, with DATA_MODEL's values for an open record and for ABSENT / LEAVE (no punch_in)."""
+    fields = {"work_hours": None, "late_minutes": 0, "overtime_minutes": 0, "half_day": False}
+    if punch_in is not None:
+        fields["late_minutes"] = compute_late_minutes(punch_in, emp["shift_start"], date_str)
+        if punch_out is not None:
+            fields.update(punch_out_fields(punch_in, punch_out, emp, date_str))
+    return fields
+
+
+def validation_error(loc: tuple, msg: str, value) -> RequestValidationError:
+    """A 422 with FastAPI's default body ({"detail": [...]}), for rules a pydantic model cannot express."""
+    return RequestValidationError([{"type": "value_error", "loc": loc, "msg": msg, "input": value}])
+
+
+def check_punch_out_window(punch_in: datetime, punch_out: datetime, loc: tuple) -> None:
+    if punch_out <= punch_in:
+        raise validation_error(loc, "punch_out must be after punch_in", to_millis(punch_out))
+    if punch_out - punch_in > MAX_SHIFT_LENGTH:
+        raise validation_error(loc, "punch_out must be within 24 hours of punch_in", to_millis(punch_out))
+
+
 def employee_out(doc: dict) -> dict:
     return {
         "emp_code": doc["emp_code"],
@@ -155,18 +197,33 @@ def history_entry_out(entry: dict) -> dict:
     return {"at": to_millis(entry.get("at")), "by": entry.get("by"), "reason": entry.get("reason"), "changes": changes}
 
 
-def record_out(doc: dict) -> dict:
-    """AttendanceRecord. Legacy documents may omit history / half_day / late / overtime (DATA_MODEL: [] / false / 0)."""
+CORRECTABLE_FIELDS = ("status", "punch_in", "punch_out")
+TRACKED_FIELDS = CORRECTABLE_FIELDS + ("work_hours", "late_minutes", "overtime_minutes", "half_day")
+
+
+def stored_values(doc: dict) -> dict:
+    """The record's fields as the API sees them. Legacy documents may omit late / overtime / half_day
+    (DATA_MODEL: 0 / 0 / false); work_hours has no documented default and stays null."""
     return {
-        "emp_code": doc["emp_code"],
-        "date": doc["date"],
         "status": doc["status"],
-        "punch_in": to_millis(doc.get("punch_in")),
-        "punch_out": to_millis(doc.get("punch_out")),
+        "punch_in": doc.get("punch_in"),
+        "punch_out": doc.get("punch_out"),
         "work_hours": doc.get("work_hours"),
         "late_minutes": doc.get("late_minutes") or 0,
         "overtime_minutes": doc.get("overtime_minutes") or 0,
         "half_day": doc.get("half_day") or False,
+    }
+
+
+def record_out(doc: dict) -> dict:
+    """AttendanceRecord. A legacy document without history has had no corrections (DATA_MODEL: [])."""
+    values = stored_values(doc)
+    return {
+        "emp_code": doc["emp_code"],
+        "date": doc["date"],
+        **values,
+        "punch_in": to_millis(values["punch_in"]),
+        "punch_out": to_millis(values["punch_out"]),
         "history": [history_entry_out(h) for h in doc.get("history") or []],
     }
 
@@ -212,6 +269,21 @@ class PunchInIn(BaseModel):
     status: PresenceStatus = "PRESENT"
 
 
+class PunchOutIn(BaseModel):
+    emp_code: str
+    punched_at: Optional[EpochMillis] = None  # same as punch-in: omitted (or null) means now
+
+
+class RegularizeIn(BaseModel):
+    """Omitted means unchanged. The schema is not nullable, so an explicit null fails validation (422): the
+    None defaults are not validated. Derived fields sent by a client are ignored (pydantic drops extra keys)."""
+    status: Status = None
+    punch_in: EpochMillis = None
+    punch_out: EpochMillis = None
+    reason: str = Field(min_length=5, max_length=200)
+    regularized_by: str = Field(min_length=1, max_length=50)
+
+
 # --------------------------------------------------------------------------- #
 # Endpoints provided
 # --------------------------------------------------------------------------- #
@@ -229,8 +301,7 @@ def health():
 def create_employee(body: EmployeeIn):
     ensure_indexes()
     doc = body.model_dump()
-    now = datetime.now(timezone.utc)
-    doc["created_at"] = now.replace(microsecond=now.microsecond // 1000 * 1000)  # BSON dates keep ms
+    doc["created_at"] = bson_now()
     try:
         db.employees.insert_one(doc)
     except DuplicateKeyError:
@@ -303,10 +374,7 @@ def list_attendance(
     page_size: PageSize = 20,
 ):
     if date_from and date_to and date_from > date_to:
-        raise RequestValidationError([{
-            "type": "value_error", "loc": ("query", "date_from"),
-            "msg": "date_from must be on or before date_to", "input": date_from,
-        }])
+        raise validation_error(("query", "date_from"), "date_from must be on or before date_to", date_from)
     q = attendance_list_query(emp_code, date_from, date_to, status)
     total = db.attendance_logs.count_documents(q)
     cursor = db.attendance_logs.find(q).sort(ATTENDANCE_LIST_SORT).skip((page - 1) * page_size).limit(page_size)
@@ -314,9 +382,115 @@ def list_attendance(
 
 
 # --------------------------------------------------------------------------- #
+# Punch-out and corrections
+# --------------------------------------------------------------------------- #
+@app.post("/attendance/punch-out")
+def punch_out(body: PunchOutIn):
+    emp = db.employees.find_one({"emp_code": body.emp_code})
+    if emp is None:
+        raise HTTPException(404, "employee not found")
+    ts = from_millis(body.punched_at) if body.punched_at is not None else truncate(datetime.now(timezone.utc))
+    for _ in range(WRITE_ATTEMPTS):
+        # The most recent punch-in at or before the punch-out, whatever its date: an overnight shift is closed the
+        # next calendar day. $lte on a date never matches a null / missing punch_in, so ABSENT / LEAVE are skipped.
+        rec = db.attendance_logs.find_one(
+            {"emp_code": body.emp_code, "punch_in": {"$lte": ts}}, sort=[("punch_in", DESCENDING)]
+        )
+        if rec is None:
+            raise HTTPException(404, "no punch-in found")
+        if rec.get("punch_out") is not None:  # that record is closed; never fall back to an older open one
+            raise HTTPException(409, "already punched out")
+        check_punch_out_window(rec["punch_in"], ts, ("body", "punched_at"))
+        # Conditional write: of simultaneous punch-outs only one can still match punch_out == null (the others
+        # re-read, see it closed and get 409), and none can store values computed from a punch_in that a concurrent
+        # correction has since changed (that one re-reads and recomputes). late_minutes and history are not
+        # punch-out's to change.
+        updated = db.attendance_logs.find_one_and_update(
+            {"_id": rec["_id"], "punch_in": rec["punch_in"], "punch_out": None},
+            {"$set": {"punch_out": ts, **punch_out_fields(rec["punch_in"], ts, emp, rec["date"])}},
+            return_document=ReturnDocument.AFTER,
+        )
+        if updated is not None:
+            return record_out(updated)
+    raise HTTPException(409, "the record is being changed concurrently; retry")
+
+
+def regularized_values(rec: dict, body: RegularizeIn, emp: dict) -> dict:
+    """The record's final status, punch times and derived fields (R2-R5) after applying the request, or a 422."""
+    old = stored_values(rec)
+    status = body.status if body.status is not None else old["status"]
+    if status in NOT_PRESENT:
+        for field in ("punch_in", "punch_out"):
+            if getattr(body, field) is not None:
+                raise validation_error(("body", field), f"{status} clears both punch times; {field} cannot be set",
+                                       getattr(body, field))
+        punch_in = punch_out = None
+    else:
+        punch_in = from_millis(body.punch_in) if body.punch_in is not None else old["punch_in"]
+        if punch_in is None:
+            raise validation_error(("body", "punch_in"), f"{status} requires a punch_in", None)
+        if body.punch_in is not None and attendance_date(punch_in, emp["shift_start"], emp["shift_end"]) != rec["date"]:
+            raise validation_error(("body", "punch_in"), f"punch_in must fall on the attendance date {rec['date']}",
+                                   body.punch_in)
+        punch_out = from_millis(body.punch_out) if body.punch_out is not None else old["punch_out"]
+        if punch_out is not None:  # checked against the final punch_in, so moving only punch_in is covered too
+            loc = ("body", "punch_out" if body.punch_out is not None else "punch_in")
+            check_punch_out_window(punch_in, punch_out, loc)
+    new = {"status": status, "punch_in": punch_in, "punch_out": punch_out}
+    # "Changes nothing" is judged on what the client can set: a request equal to the stored status and times is a
+    # 422 even if the stored derived values are stale (they are authoritative and are not rewritten as a side effect).
+    if all(new[f] == old[f] for f in CORRECTABLE_FIELDS):
+        raise validation_error(("body",), "the request changes nothing", None)
+    return {**new, **derived_fields(punch_in, punch_out, emp, rec["date"])}
+
+
+def unchanged_since_read(rec: dict) -> dict:
+    """Matches the record only while everything the correction was computed from still holds the value that was read.
+    Every successful correction or punch-out changes status, a punch time or the history length."""
+    history = rec.get("history")
+    return {
+        "_id": rec["_id"],
+        "status": rec["status"],
+        "punch_in": rec.get("punch_in"),     # None also matches a missing field
+        "punch_out": rec.get("punch_out"),
+        "history": {"$size": len(history)} if isinstance(history, list) else None,
+    }
+
+
+@app.patch("/attendance/{emp_code}/{date}")
+def regularize_attendance(emp_code: str, date: Annotated[DateStr, Path()], body: RegularizeIn):
+    emp = db.employees.find_one({"emp_code": emp_code})
+    if emp is None:
+        raise HTTPException(404, "employee not found")
+    # Optimistic concurrency: compute from the record as read, write only if it is unchanged. A concurrent writer
+    # makes the write miss; then re-read and re-apply the request on top of the winner, so each success appends
+    # exactly one entry whose "from" values are the real previous state. Only sustained contention ends in 409.
+    for _ in range(WRITE_ATTEMPTS):
+        rec = db.attendance_logs.find_one({"emp_code": emp_code, "date": date})
+        if rec is None:
+            raise HTTPException(404, "no attendance record for this date")
+        old = stored_values(rec)
+        new = regularized_values(rec, body, emp)
+        entry = {
+            "at": bson_now(),
+            "by": body.regularized_by,
+            "reason": body.reason,
+            "changes": {f: {"from": old[f], "to": new[f]} for f in TRACKED_FIELDS if old[f] != new[f]},
+        }
+        if isinstance(rec.get("history"), list):
+            update = {"$set": new, "$push": {"history": entry}}
+        else:  # legacy record without history (DATA_MODEL: missing means empty)
+            update = {"$set": {**new, "history": [entry]}}
+        updated = db.attendance_logs.find_one_and_update(
+            unchanged_since_read(rec), update, return_document=ReturnDocument.AFTER
+        )
+        if updated is not None:
+            return record_out(updated)
+    raise HTTPException(409, "the record is being changed concurrently; retry")
+
+
+# --------------------------------------------------------------------------- #
 # TODO - the rest of the contract (see openapi.yaml):
-#   POST  /attendance/punch-out
-#   PATCH /attendance/{emp_code}/{date}
 #   GET   /analytics/employees/{emp_code}/monthly
 #   GET   /analytics/departments/summary
 #   GET   /analytics/leaderboard/late
