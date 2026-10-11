@@ -9,6 +9,7 @@ works, but nobody has reviewed it. Read PROBLEM_STATEMENT.docx for what is expec
 openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
 import calendar
+import json
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -16,7 +17,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Annotated, Literal, Optional
 
-from bson import Decimal128
+from bson import Decimal128, json_util
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Path, Query
 from fastapi.exceptions import RequestValidationError
@@ -376,6 +377,21 @@ def attendance_list_query(emp_code, date_from, date_to, status) -> dict:
 ATTENDANCE_LIST_SORT = [("date", DESCENDING), ("emp_code", ASCENDING)]
 
 
+def attendance_list_find(emp_code, date_from, date_to, status, page: int, page_size: int) -> dict:
+    """The page query of GET /attendance as find() arguments; the explain endpoint runs the same ones."""
+    return {
+        "filter": attendance_list_query(emp_code, date_from, date_to, status),
+        "sort": ATTENDANCE_LIST_SORT,
+        "skip": (page - 1) * page_size,
+        "limit": page_size,
+    }
+
+
+def check_date_order(date_from: Optional[str], date_to: Optional[str]) -> None:
+    if date_from and date_to and date_from > date_to:
+        raise validation_error(("query", "date_from"), "date_from must be on or before date_to", date_from)
+
+
 @app.get("/attendance")
 def list_attendance(
     emp_code: Optional[str] = None,
@@ -385,11 +401,10 @@ def list_attendance(
     page: Page = 1,
     page_size: PageSize = 20,
 ):
-    if date_from and date_to and date_from > date_to:
-        raise validation_error(("query", "date_from"), "date_from must be on or before date_to", date_from)
-    q = attendance_list_query(emp_code, date_from, date_to, status)
-    total = db.attendance_logs.count_documents(q)
-    cursor = db.attendance_logs.find(q).sort(ATTENDANCE_LIST_SORT).skip((page - 1) * page_size).limit(page_size)
+    check_date_order(date_from, date_to)
+    spec = attendance_list_find(emp_code, date_from, date_to, status, page, page_size)
+    total = db.attendance_logs.count_documents(spec["filter"])
+    cursor = db.attendance_logs.find(**spec)
     return {"items": [record_out(d) for d in cursor], "total": total, "page": page, "page_size": page_size}
 
 
@@ -797,6 +812,66 @@ def department_trend(
 
 
 # --------------------------------------------------------------------------- #
-# TODO - the rest of the contract (see openapi.yaml):
-#   GET   /admin/explain/{endpoint}
+# Explain
 # --------------------------------------------------------------------------- #
+# The explained command is built by the same functions the endpoint calls, from the same parameters, so the plan is
+# the plan of the real query: same filter, sort and page for /attendance (its main query is the page find, not the
+# count), the same pipeline, on the same collection, for the analytics.
+ExplainTarget = Literal["attendance_list", "employee_monthly", "department_summary", "late_leaderboard",
+                        "department_trend"]
+EXPLAIN_REQUIRED = {  # the parameters the explained endpoint requires (path or query there, query here)
+    "attendance_list": (),
+    "employee_monthly": ("emp_code", "month"),
+    "department_summary": ("month",),
+    "late_leaderboard": ("month",),
+    "department_trend": ("department", "from", "to"),
+}
+
+
+def run_explain(command: dict) -> dict:
+    """executionStats explain of a find / aggregate command, as plain JSON (relaxed Extended JSON for the BSON types
+    the raw output can hold, e.g. the Decimal128 constants of half_up() echoed back in the command)."""
+    raw = db.command("explain", command, verbosity="executionStats")
+    return json.loads(json_util.dumps(raw))
+
+
+@app.get("/admin/explain/{endpoint}")
+def explain_endpoint(
+    endpoint: ExplainTarget,
+    emp_code: Optional[str] = None,
+    month: Annotated[Optional[Month], Query()] = None,
+    department: Optional[str] = None,
+    limit: Limit = 10,
+    date_from: Annotated[Optional[DateStr], Query()] = None,
+    date_to: Annotated[Optional[DateStr], Query()] = None,
+    status: Optional[Status] = None,
+    from_: Annotated[Optional[DateStr], Query(alias="from")] = None,
+    to: Annotated[Optional[DateStr], Query()] = None,
+    page: Page = 1,
+    page_size: PageSize = 20,
+):
+    supplied = {"emp_code": emp_code, "month": month, "department": department, "from": from_, "to": to}
+    missing = [name for name in EXPLAIN_REQUIRED[endpoint] if supplied[name] is None]
+    if missing:  # FastAPI's own body for a missing required parameter, one item per parameter
+        raise RequestValidationError(
+            [{"type": "missing", "loc": ("query", name), "msg": "Field required", "input": None} for name in missing]
+        )
+    # The same checks the endpoint makes before it queries. Its 404s are decided from the query's result, so they
+    # do not apply to a plan.
+    if endpoint == "attendance_list":
+        check_date_order(date_from, date_to)
+        collection = "attendance_logs"
+        spec = attendance_list_find(emp_code, date_from, date_to, status, page, page_size)
+        command = {"find": collection, **spec, "sort": dict(spec["sort"])}  # the command takes a sort document
+    else:
+        if endpoint == "employee_monthly":
+            collection, pipeline = "employees", employee_monthly_pipeline(emp_code, month)
+        elif endpoint == "department_summary":
+            collection, pipeline = "employees", department_summary_pipeline(month, department)
+        elif endpoint == "late_leaderboard":
+            collection, pipeline = "attendance_logs", late_leaderboard_pipeline(month, limit, department)
+        else:
+            check_trend_range(from_, to)
+            collection, pipeline = "employees", department_trend_pipeline(department, from_, to)
+        command = {"aggregate": collection, "pipeline": pipeline, "cursor": {}}
+    return {"endpoint": endpoint, "collection": collection, "explain": run_explain(command)}
