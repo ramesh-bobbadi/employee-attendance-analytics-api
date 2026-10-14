@@ -54,14 +54,8 @@ TREND_MAX_DAYS = 92  # inclusive day count of the longest trend range
 # --------------------------------------------------------------------------- #
 # Indexes
 # --------------------------------------------------------------------------- #
-_indexes_ready = False
-
-
 def ensure_indexes() -> None:
     """Idempotent. The unique indexes are what make concurrent creates/punch-ins race-safe."""
-    global _indexes_ready
-    if _indexes_ready:
-        return
     db.employees.create_index([("emp_code", ASCENDING)], unique=True, name="emp_code_unique")
     db.employees.create_index([("department", ASCENDING), ("emp_code", ASCENDING)], name="department_emp_code")
     db.attendance_logs.create_index(
@@ -69,7 +63,6 @@ def ensure_indexes() -> None:
     )
     db.attendance_logs.create_index([("date", DESCENDING), ("emp_code", ASCENDING)], name="date_desc_emp_code")
     db.employees.create_index([("joined_on", ASCENDING)], name="joined_on")  # department summary's R9 population
-    _indexes_ready = True
 
 
 @asynccontextmanager
