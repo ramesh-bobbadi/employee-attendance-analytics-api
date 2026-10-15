@@ -1,13 +1,3 @@
-"""
-Employee Attendance & Analytics API (FastAPI + MongoDB).
-
-Run:  uvicorn app.main:app --port 8000
-Env:  MONGO_URI, MONGO_DB. A local .env is optional; real environment variables take precedence.
-
-The contract is openapi.yaml (endpoints, status codes, business rules R1 - R10); the stored
-documents are described in DATA_MODEL.md. Starter defects and their fixes are listed in
-REVIEW.md, design choices in DECISIONS.md.
-"""
 import calendar
 import json
 import logging
@@ -33,6 +23,7 @@ log = logging.getLogger("attendance")
 # tz_aware=True: stored instants come back as UTC-aware datetimes, so they can be compared with
 # and converted from epoch ms without guessing a zone. The short server-selection timeout lets
 # /health answer 503 quickly instead of hanging for PyMongo's 30 s default.
+
 client = MongoClient(
     os.getenv("MONGO_URI", "mongodb://localhost:27017"),
     tz_aware=True,
@@ -50,10 +41,8 @@ NOT_PRESENT = ("ABSENT", "LEAVE")
 WRITE_ATTEMPTS = 10  # optimistic-concurrency retries before a conditional write gives up with 409
 TREND_MAX_DAYS = 92  # inclusive day count of the longest trend range
 
+# indexes
 
-# --------------------------------------------------------------------------- #
-# Indexes
-# --------------------------------------------------------------------------- #
 def ensure_indexes() -> None:
     """Idempotent. The unique indexes are what make concurrent creates/punch-ins race-safe."""
     db.employees.create_index([("emp_code", ASCENDING)], unique=True, name="emp_code_unique")
@@ -76,10 +65,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0", lifespan=lifespan)
 
-
-# --------------------------------------------------------------------------- #
 # Helpers
-# --------------------------------------------------------------------------- #
 # Every instant inside the app is a UTC-aware datetime truncated to whole seconds (R1).
 # Epoch ms only exist at the HTTP boundary (from_millis / to_millis).
 def from_millis(ms: int) -> datetime:
@@ -227,9 +213,9 @@ def record_out(doc: dict) -> dict:
     }
 
 
-# --------------------------------------------------------------------------- #
+
 # Models
-# --------------------------------------------------------------------------- #
+
 def _real_date(value: str) -> str:
     date.fromisoformat(value)  # ValueError (e.g. 2026-02-30) becomes a 422
     return value
@@ -290,9 +276,8 @@ class RegularizeIn(BaseModel):
     regularized_by: str = Field(min_length=1, max_length=50)
 
 
-# --------------------------------------------------------------------------- #
 # Endpoints provided
-# --------------------------------------------------------------------------- #
+
 @app.get("/health")
 def health():
     try:
@@ -401,9 +386,8 @@ def list_attendance(
     return {"items": [record_out(d) for d in cursor], "total": total, "page": page, "page_size": page_size}
 
 
-# --------------------------------------------------------------------------- #
 # Punch-out and corrections
-# --------------------------------------------------------------------------- #
+
 @app.post("/attendance/punch-out")
 def punch_out(body: PunchOutIn):
     emp = db.employees.find_one({"emp_code": body.emp_code})
@@ -509,13 +493,12 @@ def regularize_attendance(emp_code: str, date: Annotated[DateStr, Path()], body:
     raise HTTPException(409, "the record is being changed concurrently; retry")
 
 
-# --------------------------------------------------------------------------- #
 # Analytics
-# --------------------------------------------------------------------------- #
 # Every figure is computed inside MongoDB from the STORED derived fields (DATA_MODEL: they are authoritative, and a
 # legacy value may differ from what the punch times would give today); the punch times are never even fetched. Each
 # pipeline is built by a function of the request parameters, so the explain endpoint can run exactly what the endpoint
 # runs.
+
 LOG_DEFAULTS = {"late_minutes": 0, "overtime_minutes": 0, "half_day": False}  # DATA_MODEL: what a missing field means
 LOG_FIELDS = {"_id": 0, "date": 1, "status": 1, "work_hours": 1, "late_minutes": 1, "overtime_minutes": 1,
               "half_day": 1}
@@ -804,9 +787,8 @@ def department_trend(
     return {"department": department, "items": items}
 
 
-# --------------------------------------------------------------------------- #
 # Explain
-# --------------------------------------------------------------------------- #
+
 # The explained command is built by the same functions the endpoint calls, from the same parameters, so the plan is
 # the plan of the real query: same filter, sort and page for /attendance (its main query is the page find, not the
 # count), the same pipeline, on the same collection, for the analytics.
